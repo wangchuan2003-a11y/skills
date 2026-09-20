@@ -7,6 +7,8 @@ import argparse
 from dataclasses import dataclass
 import os
 import shutil
+import stat
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -169,11 +171,48 @@ def _validate_skill(path: str) -> None:
         raise InstallError("SKILL.md not found in selected skill directory.")
 
 
-def _copy_skill(src: str, dest_dir: str) -> None:
+def _validate_source_tree(src: str, repo_root: str) -> None:
+    lexical_root = Path(os.path.abspath(repo_root))
+    root = lexical_root.resolve(strict=True)
+    path = Path(os.path.abspath(src))
+    if not path.is_relative_to(lexical_root):
+        raise InstallError("Skill source escapes repository.")
+    # Check ancestors too: a normal directory below a symlink is unsafe.
+    for item in (path, *path.parents):
+        if item == lexical_root:
+            break
+        if item.is_symlink():
+            raise InstallError(f"Symlinks are not allowed: {item}")
+    if not path.resolve(strict=True).is_relative_to(root):
+        raise InstallError("Skill source resolves outside repository.")
+    for directory, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            item = Path(directory) / name
+            mode = item.lstat().st_mode
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise InstallError(f"Symlink or special file is not allowed: {item}")
+
+
+def _copy_skill(src: str, dest_dir: str, repo_root: str | None = None) -> None:
+    _validate_source_tree(src, repo_root or os.path.dirname(os.path.abspath(src)))
     os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
-    if os.path.exists(dest_dir):
+    if os.path.lexists(dest_dir):
         raise InstallError(f"Destination already exists: {dest_dir}")
-    shutil.copytree(src, dest_dir)
+    # Preserve any links that appear while copying, then reject them before install.
+    with tempfile.TemporaryDirectory(prefix=".skill-stage-", dir=os.path.dirname(dest_dir)) as stage:
+        staged = os.path.join(stage, "skill")
+        shutil.copytree(src, staged, symlinks=True)
+        _validate_source_tree(staged, stage)
+        os.mkdir(dest_dir)  # Exclusive reservation; never overwrite an existing path.
+        original = os.stat(dest_dir, follow_symlinks=False)
+        try:
+            shutil.copytree(staged, dest_dir, dirs_exist_ok=True, symlinks=True)
+        except BaseException:
+            if os.path.lexists(dest_dir):
+                current = os.stat(dest_dir, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+                    shutil.rmtree(dest_dir)
+            raise
 
 
 def _build_repo_url(owner: str, repo: str) -> str:
@@ -290,8 +329,9 @@ def main(argv: list[str]) -> int:
                 if os.path.exists(dest_dir):
                     raise InstallError(f"Destination already exists: {dest_dir}")
                 skill_src = os.path.join(repo_root, path)
+                _validate_source_tree(skill_src, repo_root)
                 _validate_skill(skill_src)
-                _copy_skill(skill_src, dest_dir)
+                _copy_skill(skill_src, dest_dir, repo_root)
                 installed.append((skill_name, dest_dir))
         finally:
             if os.path.isdir(tmp_dir):
